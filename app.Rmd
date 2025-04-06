@@ -1,0 +1,18 @@
+---
+title: "app"
+output: html_document
+---
+
+library(dplyr)
+library(ebirdst)
+library(fields)
+library(ggplot2)
+library(lubridate)
+library(rnaturalearth)
+library(sf)
+library(terra)
+library(tidyr)
+library(prioritizr)
+extract <- terra::extract
+
+print("Done")
