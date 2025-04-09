@@ -1,24 +1,20 @@
 library(dplyr)
 library(ebirdst)
-library(fields)
-library(ggplot2)
-library(lubridate)
 library(rnaturalearth)
-library(sf)
 library(terra)
-library(tidyr)
 library(prioritizr)
+library(sf)
 extract <- terra::extract
 
 # Read the CSV file
-bird_data <- read.csv("data/CO_regional_status_2023.csv")
+bird_data <- read.csv("../R-data/CO_regional_status_2023.csv")
 
 # Extract the top 100 species with lowest state_trend_median values
 list_species <- bird_data %>%
   # Sort by state_trend_median in ascending order (lowest first)
   arrange(desc(percent_pop_breeding)) %>%
   # Take the first 100 rows after sorting
-  slice_head(n = 25) %>%
+  slice_head(n = 3) %>%
   # Select only the species_code column
   pull(common_name)
 
@@ -27,24 +23,39 @@ print(list_species)
 
 # download seasonal relative abundance data
 ebirdst_download_status("wesmea",
-                        pattern = "abundance_seasonal_mean")
+                        pattern = "proportion-population_seasonal_mean_3km")
 
 # load seasonal mean relative abundance at 3km resolution
-abd_seasonal <- load_raster("wesmea", 
-                            product = "abundance", 
-                            period = "seasonal",
-                            metric = "mean",
-                            resolution = "3km")
-
-# extract just the breeding season relative abundance
-abd_breeding <- abd_seasonal[["breeding"]]
+abd_breeding <- load_raster("wesmea",
+                    product = "proportion-population",
+                    period = "seasonal") |>
+                    subset("breeding")
 
 # region boundary
 region_boundary <- ne_states(iso_a2 = "US") |> 
-  filter(name == "Colorado") |>
-  st_transform(st_crs(abd_breeding)) |> 
-  vect()
+  filter(name == "Colorado")
 
+# project boundary to match raster data
+region_boundary_proj <- st_transform(region_boundary, st_crs(abd_breeding))
+
+# project boundary to match raster data
+region_boundary_bird_crs <- st_transform(region_boundary, st_crs(abd_breeding))
+
+#-----------------------------------------
+# Now load bird data
+#-----------------------------------------
+
+# find the centroid of the region
+region_centroid <- region_boundary |> 
+  st_geometry() |> 
+  st_transform(crs = 4326) |> 
+  st_centroid() |> 
+  st_coordinates() |> 
+  round(1)
+
+# define projection
+crs_laea <- paste0("+proj=laea +lat_0=", region_centroid[2],
+                   " +lon_0=", region_centroid[1])
 
 # Initialize an empty list to store individual species rasters
 prop_pop <- list()
@@ -67,16 +78,23 @@ for (sp in list_species) {
     pp <- load_raster(sp,
                     product = "proportion-population",
                     period = "seasonal") |>
-      subset("breeding")
-    
+                    subset("breeding")
+
+    #pp <- terra::mask(terra::crop(pp, region_boundary_bird_crs), region_boundary_bird_crs)
+    #pp <- terra::crop(pp, region_boundary_bird_crs)
+    pp <- crop(pp, region_boundary_proj) |> 
+      mask(region_boundary_proj)
+    # transform to the custom projection using nearest neighbor resampling
+    species_raster <- project(pp, crs_laea, method = "near") |> 
+      trim() 
+      # remove areas of the raster containing no data
+      
+
     # Convert to SpatRaster if it's not already
     # (load_raster might return a raster object rather than a terra object)
     if (!inherits(pp, "SpatRaster")) {
       pp <- terra::rast(pp)
     }
-    
-    # crop and mask to region using terra functions
-    species_raster <- terra::mask(terra::crop(pp, region_boundary), region_boundary)
     
     # Store in the original list indexed by species
     prop_pop[[sp]] <- species_raster
@@ -103,44 +121,49 @@ if (length(raster_list) > 0) {
   cat("Warning: No species were successfully processed.\n")
 }
 
-
-
 # Create a multi-layer SpatRaster from the list of individual rasters
 bird_features <- terra::rast(raster_list)
 
 # Name the layers by species
 names(bird_features) <- species_names
+print(bird_features)
 
+#print(bird_features)
 # Create a visual check of the study area
 png("plots/first9_birds.png", width=800, height=800, res=150)
 plot(bird_features[[1:9]], nr = 3, axes = FALSE)
 dev.off()
+print("Bird features processed!")
+
+ext_bird <- ext(bird_features)
 
 #-----------------------------------------
 # Now load and transform all other data to match abundance CRS
 #-----------------------------------------
 # 1. Import the land cost TIF file
-cost_raster <- rast("data/places_fmv_pnas_dryad/1 estimates/places_fmv_all.tif")
+#cost_raster <- terra::rast("../R-data/places_fmv_pnas_dryad/1 estimates/output.tif")#, ext=ext_bird)
+cost_raster <- terra::rast("../R-data/places_fmv_pnas_dryad/1 estimates/test.tif")#, ext=ext_bird)
+#https://www.pnas.org/doi/10.1073/pnas.2012865117
+#print(ext(cost_raster))
+#print(ext_bird)
+#print(ext(cost_raster))
 
-reference_crs <- crs(bird_features)  # Get the CRS of the bird features raster
+png("plots/base_cost.png", width=800, height=800, res=150)
+plot(cost_raster, axes = FALSE)
+dev.off()
 
-# Transform cost raster to match abundance CRS if different
-if (crs(cost_raster) != reference_crs) {
-  cat("Reprojecting cost raster to match abundance CRS...\n")
-  cost_raster <- project(cost_raster, reference_crs)
-}
-
-# 3. Crop cost raster to study area
-cost_raster_crop <- crop(cost_raster, region_boundary)
+cost_raster <- project(cost_raster, crs_laea, res=terra::res(bird_features)[1], method = "near") |> 
+      trim() 
 
 # Resample to match multi-layer dimensions
-cost_final <- terra::resample(cost_raster_crop, bird_features, method = "bilinear")
+cost_final <- terra::resample(cost_raster, bird_features, method = "bilinear")
 
 # calculate budget
 budget <- 10000 #terra::global(cost_raster_crop, "sum", na.rm = TRUE)[[1]] * 0.05
 
-print(bird_features)
-print(cost_final)
+png("plots/final_cost.png", width=800, height=800, res=150)
+plot(cost_final, axes = FALSE)
+dev.off()
 
 # create problem
 p1 <-
@@ -167,8 +190,6 @@ print(attr(s1, "status"))
 
 # plot the solution
 plot(s1, main = "Solution", axes = FALSE)
-# Add a basemap to the plot
-library(rasterVis)
 
 # Create a basemap using the region boundary
 basemap <- terra::mask(terra::crop(cost_raster, region_boundary), region_boundary)
